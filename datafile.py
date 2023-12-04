@@ -1,6 +1,425 @@
+import dissect.cstruct
+
+# You can implement your own types by subclassing BaseType or RawType, and
+# adding them to your cstruct instance with addtype(name, type)
+
+TRUE = 0xffffffffffffffff
+FALSE = 0
+def break0():
+    import pdb; pdb.set_trace()
+    return 0
+dissect.cstruct.expression.Expression.operators.extend([
+    ['andsumright', lambda x, y: x & sum(y)], # operate on lists of 1s or 0s to calculate an entry for each item with a value of 1
+    ['<',  lambda x, y: TRUE if x <  y else FALSE],
+    ['<=', lambda x, y: TRUE if x <= y else FALSE],
+    ['==', lambda x, y: TRUE if x == y else FALSE],
+    ['>=', lambda x, y: TRUE if x >= y else FALSE],
+    ['>',  lambda x, y: TRUE if x >  y else FALSE],
+])
+
+class ZeroTerminated(dissect.cstruct.RawType):
+    def __init__(self, cstruct, type):
+        self.subtype = cstruct.typedefs[type]
+        super().__init__(cstruct, self.subtype.name, 0, self.subtype.alignment)
+    def __getattr__(self, name):
+        return getattr(self.subtype, name)
+    def _read(self, stream, context = None):
+        return self.subtype._read_0(stream, context)
+    def _write(self, stream, data):
+        return self.subtype._write_0(stream, data)
+    def default(self):
+        return self.subtype.default
+
+class ConditionalType(dissect.cstruct.RawType):
+    def __init__(self, cstruct, subtype, default_value):
+        self.subtype = cstruct.typedefs[subtype]
+        self.default_value = default_value
+        super().__init__(cstruct, self.subtype.name, 0, self.subtype.alignment)
+    def __getattr__(self, name):
+        return getattr(self.subtype, name)
+    def _read_array(self, stream, count, context = None):
+        assert count == TRUE or count == 0
+        if count:
+            return self.subtype._read(stream, context)
+        else:
+            return self.default_value
+    def _write_array(self, stream, data):
+        if data is not None and data != self.default_value:
+            return self.subtype._write(stream, data) 
+        else:
+            return 0
+    def default_array(self):
+        return self.default_value
+
+#class ConstantType(dissect.cstruct.BaseType):
+#    def __init__(self, cstruct, type, value):
+#        self.subtype = cstruct.typedefs[type]
+#        self.value = value
+#    def __getattr__(self, name):
+#        return getattr(self.subtype, name)
+#    def _read(self, stream, context = None):
+#        data = self.subtype._read(stream, context)
+#        assert data == self.value
+#        return data
+#    def _read_array(self, stream, count, context = None):
+#        if self.value == b'SCOM':
+#            import pdb; pdb.set_trace()
+#        data = self.subtype._read_array(stream, count, context)
+#        assert data == self.value
+#        return data
+#    def _write(self, stream, data):
+#        assert data == self.value
+#        return self.subtype._write(stream, data)
+#    def default(self):
+#        return self.value
+#    def default_array(self):
+#        return self.value
+
+class LengthPrefixedArray(dissect.cstruct.RawType):
+    def __init__(self, cstruct, prefixtype, itemtype):
+        self.prefixtype = cstruct.typedefs[prefixtype]
+        self.itemtype = cstruct.typedefs[itemtype]
+        self.brk = itemtype == 'cstr'
+        super().__init__(cstruct, self.itemtype.name, 0, max(self.itemtype.alignment, self.prefixtype.alignment))
+    def __getattr__(self, name):
+        return getattr(self.itemtype, name)
+    def _read(self, stream, context = None):
+        #if self.brk:
+        #    import pdb; pdb.set_trace()
+        count = self.prefixtype._read(stream, context)
+        return self.itemtype._read_array(stream, count, context)
+    def _write(self, stream, data):
+        return self.prefixtype._write(stream, len(data)) + self.itemtype._write_array(stream, data)
+    def default(self):
+        return self.itemtype.default_array()
+
+class AdditionEncryptedString(LengthPrefixedArray):
+    def __init__(self, cstruct, prefixtype, key):
+        super().__init__(cstruct, prefixtype, 'uint8')
+        self.key = key
+    def _read(self, stream, context = None):
+        encrypted = super()._read(stream, context)
+        decrypted = bytes([
+            (encrypted[idx] - self.key[idx % len(self.key)]) & 0xff
+            for idx in range(len(encrypted))
+        ]).decode()
+        assert decrypted[-1] == '\0'
+        return decrypted[:-1]
+    def _write(self, stream, decrypted):
+        decrypted = (decrypted + '\0').encode()
+        encrypted = bytes([
+            (decrypted[idx] + self.key[idx % len(self.key)]) & 0xff
+            for idx in range(len(decrypted))
+        ])
+        return super()._write(encrypted)
+
+#class MaskItems(dissect.cstruct.BaseType):
+#    def __init__(self, cstruct, itemtype, setval = 1, unsetval = 0):
+#        self.itemtype = cstruct.typedefs[itemtype]
+#        self.setval = setval
+#        self.unsetval = unsetval
+#        super().__init__(cstruct)
+#    def __getattr__(self, name):
+#        return getattr(self.itemtype, name)
+#    def _read_array(self, stream, count, context = None):
+#        result = []
+#        for item in count:
+#            assert item in [self.setval, self.unsetval]
+#            if item == self.setval:
+#                item = self.subtype._read(stream, context)
+#            else:
+#                item = None
+#            result.append(item)
+#        return result
+#    def _write_array(self, stream, data):
+#        result = 0
+#        for item in data:
+#            if item is not None:
+#                result += self.subtype._write(stream, item)
+#        return result
+
+cstructs = dissect.cstruct.cstruct()
+cstructs.addtype('cstr', ZeroTerminated(cstructs, 'char'))
+#cstructs.addtype('SCOMchars', Constant(cstructs, 'char', b'SCOM'))
+cstructs.addtype('uint32_cond_or_0', ConditionalType(cstructs, 'uint32', 0))
+cstructs.addtype('uint32_cond_or_6000', ConditionalType(cstructs, 'uint32', 6000))
+cstructs.addtype('uint32_chars', LengthPrefixedArray(cstructs, 'uint32', 'char'))
+cstructs.addtype('uint32_uint32_chars', LengthPrefixedArray(cstructs, 'uint32', 'uint32_chars'))
+cstructs.addtype('uint32_cstrs', LengthPrefixedArray(cstructs, 'uint32', 'cstr'))
+cstructs.addtype('uint32_uint8s', LengthPrefixedArray(cstructs, 'uint32', 'uint8'))
+cstructs.addtype('uint32_uint32s', LengthPrefixedArray(cstructs, 'uint32', 'uint32'))
+cstructs.addtype('uint32_int32s', LengthPrefixedArray(cstructs, 'uint32', 'int32'))
+cstructs.addtype('encrypted', AdditionEncryptedString(cstructs, 'uint32', b'Avis Durgan'))
+#cstructs.addtype('cstr_for', MaskItems(cstructs, 'cstr', 1, 0)
+#cstructs.addtype('encrypted_for', MaskItems(cstructs, 'encrypted', 1, 0)
+#cstructs.load('typedef cstr_for[f_g_msgs] cstr_for_f_g_msgs;')
+#cstructs.load('typedef encrypted_for[f_g_msgs] encrypted_for_f_g_msgs;')
+#cstructs.addtype('cstr_for_f_g_msgs_cond_or_[]', ConditionalType(cstructs, 'cstr_for_f_g_msgs', []))
+#cstructs.addtype('encrypted_for_f_g_msgs_cond_or_[]', ConditionalType(cstructs, 'encrypted_for_f_g_msgs', []))
+
+cdef = '''
+union Col4x8 {
+  struct {
+    uint8 r;
+    uint8 g;
+    uint8 b;
+    uint8 a;
+  };
+  uint8 chans[4];
+};
+union Coord2x32 {
+  struct {
+     int32 x;
+     int32 y;
+  };
+  uint32 coords[2];
+};
+union Coord2x16 {
+  struct {
+     int16 x;
+     int16 y;
+  };
+  uint16 coords[2];
+};
+struct Font00 {
+  uint8 flags;
+  uint8 outline;
+};
+struct Font48 {
+  uint32 yoffset;
+};
+struct Font49 {
+  uint32 yoffset;
+  uint32 linespacing;
+};
+struct Font50 {
+  uint32 flags;
+  uint32 sizemultiplier;
+   int32 outline;
+   int32 yoffset;
+   int32 linespacing;
+};
+struct Item {
+  char name[24];
+  uint8 padding_head[4];
+  uint32 image;
+  uint32 cursor;
+  Coord2x32 hotspot;
+  uint8 padding_tail[5*4];
+  uint32 f_start_with;
+};
+struct Cursor {
+  uint32 image;
+  Coord2x16 hotspot;
+  int16 anim;
+  char name[10];
+  uint32 flags;
+};
+struct CommandList00 {
+  uint8 flag;
+  uint32_cond_or_0 n_cmds[flag == 1];
+  uint32 types[n_cmds];
+   int32 f_resps[n_cmds];
+  uint8 unimplemntedted[unimplemented use MaskItems to implement];
+};
+struct CommandList33 {
+  uint32_cstrs cmds;
+};
+struct Word {
+  encrypted word;
+  uint16 group;
+};
+struct View00 {
+  uint8 notimp[not implemented];
+};
+struct Frame33 {
+  uint32 pic;
+  Coord2x16 offs;
+  uint16 speed;
+  uint8 speed_padding[2];
+  uint32 flags;
+   int32 sound;
+  uint8 padding[8];
+};
+struct Loop33 {
+  uint16 n_frames;
+  uint32 flags;
+  Frame33 frames[n_frames];
+};
+struct View33 {
+  uint16 n_loops;
+  Loop33 loops[n_loops];
+};
+struct Placement {
+  cstr name;
+  int32 offset;
+};
+struct Script {
+  char SCOM[4];
+  uint32 ver;
+  uint32 g_datasize;
+  uint32 codesize;
+  uint32 strsize;
+  uint8 g_data[g_datasize];
+  int32 code[codesize];
+  uint8 strs[strsize];
+  uint32 n_fixups;
+  uint8 fixup_types[n_fixups];
+  int32 fixups[n_fixups];
+  uint32_cstrs imports;
+  uint32 n_exports;
+  Placement exports[n_exports];
+  uint32_cond_or_0 n_sections[ver >= 83];
+  Placement sections[n_sections];
+  uint8 BEEFCAFE[4];
+};
+struct Character {
+  uint32 def_view;
+  uint32 talk_view;
+  uint32 view;
+  uint32 room;
+  uint32 prev_room;
+  Coord2x32 pos;
+  uint32 wait;
+  uint32 flags;
+  uint16 following;
+  uint16 follow_info;
+  uint32 idle_view;
+  uint16 idle_time;
+  uint16 idle_left;
+  uint16 transparency;
+  uint16 baseline;
+  uint32 active_inv;
+  Col4x8 talk_col;
+  uint32 think_view;
+  uint16 blink_view;
+  uint16 blink_interval;
+  uint16 blink_timer;
+  uint16 blink_frame;
+  uint16 walkspeed_y;
+  uint16 pic_yoffs;
+  uint32 pos_z;
+  uint32 walk_wait;
+  uint16 talk_speed;
+  uint16 idle_speed;
+  Coord2x16 blocking;
+  uint32 index_id;
+  uint16 pic_xoffs;
+  uint16 walkwaitcounter;
+  uint16 loop;
+  uint16 frame;
+  uint16 walking;
+  uint16 animating;
+  uint16 walkspeed;
+  uint16 animspeed;
+  uint16 f_items[301];
+  Coord2x16 act;
+  char name[40];
+  char script[20];
+  uint8 on;
+  uint8 padding;
+};
+struct DataFile {
+  char SIG[30];
+  uint32 data_version;
+  uint32_cond_or_0 editor_version_len[data_version >= 12];
+  char editor_version[editor_version_len];
+  uint32_cond_or_0 n_caps[data_version >= 48];
+  uint32_uint8s caps[n_caps];
+  char game_name[50];
+  uint8 padding_base_name[2];
+  int32 options[100];
+  uint8 pal_class[256];
+  Col4x8 palette[256];
+  uint32 n_views;
+  uint32 n_chars;
+  uint32 player_id;
+  uint32 max_score;
+  uint32 n_items:16;
+  uint32 n_dlgs;
+  uint32 n_msgs;
+  uint32 n_fonts;
+  uint32 col_depth;
+  uint32 target_win;
+  uint32 dlg_bullet;
+  uint16 hotspot_dot;
+  uint16 hotspot_cross;
+  uint32 unique_id;
+  uint32 n_guis;
+  uint32 n_cursors;
+  uint32 res_id;
+  uint32 res_custom[data_version >= 43 & res_id == 8 & 2]; // note: (((data_version >= 43) & res_id) == 8) & 2
+  uint32 lipsync_frame;
+  uint32 inv_hotspot;
+  uint8 padding_reserved[17*4];
+  uint32 f_g_msgs[500];
+  uint32 f_dict;
+  uint32 f_g_script;
+  uint32 f_chars;
+  uint32 f_scom;
+  char guid[data_version > 32 & 40];
+  char save_ext[data_version > 32 & 20];
+  char save_dir[data_version > 32 & 50];
+  Font00 fonts00[data_version < 50 & n_fonts];
+  Font48 fonts48[data_version == 48 & n_fonts];
+  Font49 fonts48[data_version == 49 & n_fonts];
+  Font50 fonts50[data_version >= 50 & n_fonts];
+  uint32_cond_or_6000 n_sprites[data_version > 23];
+  uint8 sprite_flags[n_sprites];
+  uint8 padding_item[68];
+  Item items[n_items-1];
+  Cursor cursors[n_cursors];
+  CommandList00 char_evts00[data_version <  33 & n_chars];
+  CommandList33 char_evts33[data_version >= 33 & n_chars];
+  CommandList00 item_evts00[data_version <  33 & n_items-1];
+  CommandList33 item_evts33[data_version >= 33 & n_items-1];
+  uint32_cond_or_0 n_g_vars[data_version < 33];
+  uint8 g_vars[n_g_vars][28];
+  uint32_cond_or_0 n_words[f_dict == 1];
+  Word dict[n_words];
+  Script g_scripts[data_version >= 38 & 1 + 1];
+  uint32_cond_or_0 n_scripts[data_version >= 31];
+  Script scripts[n_scripts];
+  View00 views[data_version <  33 & n_views];
+  View33 views[data_version >= 33 & n_views];
+  uint8 unknown[data_version < 20 & 0x204];
+  Character chars[n_chars];
+  uint32_uint8s lipsyncframes[data_version >= 20 & 50];
+  cstr g_msgs00[data_version < 26 andsumright f_g_msgs];
+  encrypted g_msgs26[data_version >= 26 andsumright f_g_msgs];
+};
+'''
+cstructs.load(cdef, compiled=False)
+class DataFile:
+    @classmethod
+    def from_stream(self, stream):
+        #import pdb; pdb.set_trace()
+        datafile = cstructs.DataFile(stream)
+        return datafile
+#from typing import Annotated  # use typing_extensions on Python <3.9
+#import dataclasses_struct as dcs
+#
+#class BytesConst(dcs.BytesField):
+#    def __init__(self, value):
+#        super().__init__(len(value))
+#        self.value = value
+#    def validate(self, val: bytes):
+#        if val != self.value:
+#            raise ValueError(f'{val} should be {self.value}')
+#
+#class Versioned(dcs.Field):
+#    def __init__(
+#
+#
+#@dcs.dataclass(dcs.LITTLE_ENDIAN)
+#class DataFile:
+#    SIG : BytesConst(b'Adventure Creator Game File v2')
+#    data_version : dcs.U32
+#    editor_version
+
 import builtins
 
-class DataFile:
+class OldDataFile:
     @classmethod
     def from_stream(cls, file):
         def bytes(ct=None):
@@ -293,4 +712,5 @@ class DataFile:
 
 if __name__ == '__main__':
     with open('ags-camdemo/build/files/game28.dta','rb') as f:
-        DataFile.from_stream(f)
+        datafile = DataFile.from_stream(f)
+        print(datafile)

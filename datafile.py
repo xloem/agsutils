@@ -1,28 +1,34 @@
+import builtins
+
 class DataFile:
     @classmethod
     def from_stream(cls, file):
-        def bytes(len):
-            return file.read(len)
+        def bytes(ct=None):
+            if ct is None:
+                ct = uint()
+            data = file.read(ct)
+            assert len(data) == ct
+            return data
         def uchar():
             return int.from_bytes(bytes(1), 'little', signed=False)
+        def sshort():
+            return int.from_bytes(bytes(2), 'little', signed=True)
         def ushort():
             return int.from_bytes(bytes(2), 'little', signed=False)
         def sint():
             return int.from_bytes(bytes(4), 'little', signed=True)
         def uint():
             return int.from_bytes(bytes(4), 'little', signed=False)
-        def bool():
-            v = uchar()
+        def bool(size=1):
+            v = int.from_bytes(bytes(size), 'little', signed=False)
             assert v & 1 == v
-            return bool(v)
+            return v == 1
         def str(len=None):
-            if len is None:
-                len = uint()
             return bytes(len).decode().rstrip('\0')
         def cstr():
             # could maybe simplify by enforcing file is io.BufferedReader, maybe using TextWrapper or something
             data = b''
-            str = ''
+            str = ' '
             while str[-1] != '\0':
                 data += bytes(1)
                 str = data.decode()
@@ -32,9 +38,12 @@ class DataFile:
                 ct = uint()
             return [typ(*params, **kwparams) for x in range(ct)]
         def decrypt(data):
-            return bytes([
+            decrypted = builtins.bytes([
                 (data[idx] + 0x100 - cls.PWD[idx % len(cls.PWD)]) & 0xff
+                for idx in range(len(data))
             ]).decode()
+            assert decrypted[-1] == '\0'
+            return decrypted[:-1]
         def interactions(ct):
             interactions = []
             if data_version > 32:
@@ -61,8 +70,9 @@ class DataFile:
                                     children = uint()
                                     parent = uint()
                                 # then there is another command list for each child with children
+            return interactions
         def name_off():
-            return [cstr(), uint()]
+            return [cstr(), sint()]
         def scom():
             assert str(4) == 'SCOM'
             ver = uint()
@@ -70,11 +80,11 @@ class DataFile:
             codesize = uint()
             strsize = uint()
             g_data = bytes(g_datasize)
-            code = bytes(codesize)
+            code = vec(sint, ct=codesize)
             strs = bytes(strsize)
             n_fixups = uint()
             fixup_types = vec(uchar, ct=n_fixups)
-            fixups = vec(uint, ct=n_fixups)
+            fixups = vec(sint, ct=n_fixups)
             imports = vec(cstr)
             exports = vec(name_off)
             sections = vec(name_off) if ver >= 83 else []
@@ -82,7 +92,7 @@ class DataFile:
             return [ver, g_data, code, strs, fixup_types, fixups, imports, exports, sections]
 
         assert len(cls.SIG) == 30
-        file_sig = str(30)
+        file_sig = bytes(30)
         assert file_sig == cls.SIG
         data_version = uint()
         editor_version = str() if data_version >= 12 else ''
@@ -95,7 +105,7 @@ class DataFile:
         # NativeConstants.GameOptions
         options = vec(sint, ct=100)
         pal_class = vec(bytes, [1], ct=256)
-        palette = vec(vec, [uint], {'ct':4}, ct=256)
+        palette = vec(vec, [uchar], {'ct':4}, ct=256)
         n_views = uint()
         n_chars = uint()
         player_id = uint()
@@ -119,12 +129,12 @@ class DataFile:
         lipsync_frame = uint()
         inv_hotspot = uint()
         assert not any(vec(uint, ct=17))
-        g_msg_mask = vec(bool, ct=500)
+        g_msg_mask = vec(bool, [4], ct=500)
         n_g_msgs = sum(g_msg_mask)
-        has_dict = bool()
-        has_globalscript = bool()
-        has_chars = bool()
-        has_compiled_script = bool()
+        has_dict = bool(4)
+        has_globalscript = bool(4)
+        has_chars = bool(4)
+        has_compiled_script = bool(4)
         if data_version > 32:
             guid = str(40)
             save_ext = str(20)
@@ -156,7 +166,7 @@ class DataFile:
         else:
             n_sprites = uint()
         sprite_flags = vec(bytes, [1], ct=n_sprites)
-        assert not any(bytes(68))
+        assert not bool(68)
         items = []
         for idx in range(n_items):
             descr = str(24)
@@ -165,22 +175,20 @@ class DataFile:
             cursor = uint()
             hotspot_x = uint()
             hotspot_y = uint()
-            assert not any(bytes(5*4))
-            startwith = bool()
-            assert not any(bytes(3))
+            assert not bool(5*4)
+            startwith = bool(4)
             items.append([descr, image, cursor, hotspot_x, hotspot_y])
         cursors = []
         for idx in range(n_cursors):
             image = uint()
             hotspot_x = ushort()
             hotspot_y = ushort()
-            anim = ushort()
+            anim = sshort()
             name = str(9)
             assert uchar() == 0
             flags = uchar()
-            assert bytes(3) == 0
-            cursor.append([image, hotspot_x, hotspot_y, anim, name, flags])
-        _n_funcnames = uint()
+            assert not bool(3)
+            cursors.append([image, hotspot_x, hotspot_y, anim, name, flags])
         char_evts = interactions(n_chars)
         item_evts = interactions(n_items)
         if data_version <= 32:
@@ -191,7 +199,7 @@ class DataFile:
             # word, word group
             words = [[decrypt(bytes()), ushort()] for word_idx in range(n_words)]
         else:
-            words = []
+            words = None
         g_script = scom()
         if data_version > 37:
             dialog_script = scom()
@@ -217,7 +225,7 @@ class DataFile:
                         speed = ushort()
                         assert ushort() == 0
                         flags = uint() # probably 3 bytes padding
-                        sound = uint()
+                        sound = sint()
                         assert not any(bytes(8))
                         frames.append([pic, xoffs, yoffs, speed, flags, sound])
                     loops.append([loop_flags, frames])
@@ -236,14 +244,14 @@ class DataFile:
             idle_view = uint()
             idle_time, idle_left, transparency, baseline = vec(ushort, ct=4)
             active_inv, talk_col, think_view = uint(), uint(), uint()
-            blink_view, blink_interval, blink_timer, blink_frane, walkspeed_y, pic_yoffs = vec(ushort, 6)
+            blink_view, blink_interval, blink_timer, blink_frane, walkspeed_y, pic_yoffs = vec(ushort, ct=6)
             z, walk_wait = uint(), uint()
             talk_speed, idle_speed = ushort(), ushort()
             blocking_width, blocking_height = ushort(), ushort()
             idx_id = uint()
             pic_xoffs, walkwaitcounter, loop, frame = vec(ushort, ct=4)
             walking, animating, walkspeed, animspeed = vec(ushort, ct=4)
-            items = vec(ushort, 301)
+            items = vec(ushort, ct=301)
             assert all([item < 2 for item in items])
             actx, acty = ushort(), ushort()
             name = str(40)
@@ -268,20 +276,20 @@ class DataFile:
         else:
             libsyncframes = []
     
-        for idx in range(len(g_msgs)):
-            if g_msgs[idx]:
+        for idx in range(len(g_msg_mask)):
+            if g_msg_mask[idx]:
                 if data_version < 26:
-                    g_msgs[idx] = cstr()
+                    g_msg_mask[idx] = cstr()
                 else:
-                    g_msgs[idx] = decrypt(bytes())
+                    g_msg_mask[idx] = decrypt(bytes())
             else:
-                g_msgs[idx] = None
+                g_msg_mask[idx] = None
 
         assert not "dialog topics and further content"
 
             
-    SIG = "Adventure Creator Game File v2"
-    PWD = "Avis Durgan"
+    SIG = b"Adventure Creator Game File v2"
+    PWD = b"Avis Durgan"
 
 if __name__ == '__main__':
     with open('ags-camdemo/build/files/game28.dta','rb') as f:

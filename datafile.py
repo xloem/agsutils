@@ -1,3 +1,5 @@
+import warnings
+warnings.warn('this code was made against the refactor-v4 branch of dissect.cstruct commit ee0786cbf6477149935c76686e33ae46638a9214 with pull requests 58 and 60 patched on, hopefully available at httpa://github.com/xloem/cstruct in branch merged')
 import dissect.cstruct
 
 # You can implement your own types by subclassing BaseType or RawType, and
@@ -5,49 +7,53 @@ import dissect.cstruct
 
 TRUE = 0xffffffffffffffff
 FALSE = 0
-dissect.cstruct.expression.Expression.operators.extend([
+dissect.cstruct.expression.Expression.binary_operators.update({
 #    ['members', lambda x, y: [getattr(z, y) for z in x]],
-    ['andsumright', lambda x, y: x & sum(y)], # operate on lists of 1s or 0s to calculate an entry for each item with a value of 1
-    ['<',  lambda x, y: TRUE if x <  y else FALSE],
-    ['<=', lambda x, y: TRUE if x <= y else FALSE],
-    ['==', lambda x, y: TRUE if x == y else FALSE],
-    ['>=', lambda x, y: TRUE if x >= y else FALSE],
-    ['>',  lambda x, y: TRUE if x >  y else FALSE],
-])
+    'andsumright': lambda x, y: x & sum(y), # operate on lists of 1s or 0s to calculate an entry for each item with a value of 1
+    'lt':  lambda x, y: TRUE if x <  y else FALSE,
+    'lte': lambda x, y: TRUE if x <= y else FALSE,
+    'eq': lambda x, y: TRUE if x == y else FALSE,
+    'gte': lambda x, y: TRUE if x >= y else FALSE,
+    'gt':  lambda x, y: TRUE if x >  y else FALSE,
+})
+dissect.cstruct.expression.Expression.precedence_levels.update({
+    'andsumright': 0,
+    'lt':  0,
+    'lte': 0,
+    'eq': 0,
+    'gte': 0,
+    'gt':  0,
+})
 
-class ZeroTerminated(dissect.cstruct.RawType):
-    def __init__(self, cstruct, type):
-        self.subtype = cstruct.typedefs[type]
-        super().__init__(cstruct, self.subtype.name, 0, self.subtype.alignment)
-    def __getattr__(self, name):
-        return getattr(self.subtype, name)
-    def _read(self, stream, context = None):
-        return self.subtype._read_0(stream, context)
-    def _write(self, stream, data):
-        return self.subtype._write_0(stream, data)
-    def default(self):
-        return self.subtype.default
+class ZeroTerminated(dissect.cstruct.BaseType):
+    type : dissect.cstruct.BaseType
+    @classmethod
+    def _read(cls, stream, context = None):
+        return cls.type._read_0(stream, context)
+        #return cls._read_0(stream, context)
+    @classmethod
+    def _write(cls, stream, data):
+        return cls.type._write_0(stream, data)
+        #return cls._write_0(stream, data)
 
-class ConditionalType(dissect.cstruct.RawType):
-    def __init__(self, cstruct, subtype, default_value):
-        self.subtype = cstruct.typedefs[subtype]
-        self.default_value = default_value
-        super().__init__(cstruct, self.subtype.name, 0, self.subtype.alignment)
-    def __getattr__(self, name):
-        return getattr(self.subtype, name)
-    def _read_array(self, stream, count, context = None):
-        assert count == TRUE or count == 0
-        if count:
-            return self.subtype._read(stream, context)
-        else:
-            return self.default_value
-    def _write_array(self, stream, data):
-        if data is not None and data != self.default_value:
-            return self.subtype._write(stream, data) 
-        else:
-            return 0
-    def default_array(self):
-        return self.default_value
+class ConditionalType(dissect.cstruct.BaseType):
+    type : dissect.cstruct.BaseType
+    dflt : object
+    class ArrayType(dissect.cstruct.BaseType, metaclass=dissect.cstruct.types.ArrayMetaType):
+        @classmethod
+        def _read(cls, stream, context):
+            count = cls.num_entries.evaluate(context)
+            assert count == TRUE or count == FALSE
+            if count == TRUE:
+                return cls.type.type._read(stream, context)
+            else:
+                return cls.type.dflt
+        @classmethod
+        def _write(cls, stream, data):
+            if data is not None and data != cls.dflt:
+                return cls.type.type._write(stream, data) 
+            else:
+                return 0
 
 #class ConstantType(dissect.cstruct.BaseType):
 #    def __init__(self, cstruct, type, value):
@@ -73,37 +79,41 @@ class ConditionalType(dissect.cstruct.RawType):
 #    def default_array(self):
 #        return self.value
 
-class LengthPrefixedArray(dissect.cstruct.RawType):
-    def __init__(self, cstruct, prefixtype, itemtype):
-        self.prefixtype = cstruct.typedefs[prefixtype]
-        self.itemtype = cstruct.typedefs[itemtype]
-        super().__init__(cstruct, self.itemtype.name, 0, max(self.itemtype.alignment, self.prefixtype.alignment))
-    def __getattr__(self, name):
-        return getattr(self.itemtype, name)
-    def _read(self, stream, context = None):
-        count = self.prefixtype._read(stream, context)
-        return self.itemtype._read_array(stream, count, context)
-    def _write(self, stream, data):
-        return self.prefixtype._write(stream, len(data)) + self.itemtype._write_array(stream, data)
-    def default(self):
+class LengthPrefixedArray(dissect.cstruct.BaseType):
+    prefixtype : type
+    itemtype : type
+    @classmethod
+    def _read(cls, stream, context = None):
+        #import pdb; pdb.set_trace()
+        count = cls.prefixtype._read(stream, context)
+        # this could maybe be slightly better done now with a nested ArrayType. cdef would need brackets.
+        return cls.itemtype._read_array(stream, count, context)
+        #array = cls.cs._make_array(cls.itemtype, count)
+        #return array._read(stream, context)
+    @classmethod
+    def _write(cls, stream, data):
+        return cls.prefixtype._write(stream, len(data)) + cls.itemtype._write_array(stream, data)
+    @classmethod
+    def default(cls):
         return self.itemtype.default_array()
 
 class AdditionEncryptedString(LengthPrefixedArray):
-    def __init__(self, cstruct, prefixtype, key):
-        super().__init__(cstruct, prefixtype, 'uint8')
-        self.key = key
-    def _read(self, stream, context = None):
+    key : object
+    @classmethod
+    def _read(cls, stream, context = None):
+        #import pdb; pdb.set_trace()
         encrypted = super()._read(stream, context)
         decrypted = bytes([
-            (encrypted[idx] - self.key[idx % len(self.key)]) & 0xff
+            (encrypted[idx] - cls.key[idx % len(cls.key)]) & 0xff
             for idx in range(len(encrypted))
         ]).decode()
         assert decrypted[-1] == '\0'
         return decrypted[:-1]
-    def _write(self, stream, decrypted):
+    @classmethod
+    def _write(cls, stream, decrypted):
         decrypted = (decrypted + '\0').encode()
         encrypted = bytes([
-            (decrypted[idx] + self.key[idx % len(self.key)]) & 0xff
+            (decrypted[idx] + cls.key[idx % len(cls.key)]) & 0xff
             for idx in range(len(decrypted))
         ])
         return super()._write(encrypted)
@@ -134,17 +144,17 @@ class AdditionEncryptedString(LengthPrefixedArray):
 #        return result
 
 cstructs = dissect.cstruct.cstruct()
-cstructs.addtype('cstr', ZeroTerminated(cstructs, 'char'))
-#cstructs.addtype('SCOMchars', Constant(cstructs, 'char', b'SCOM'))
-cstructs.addtype('uint32_cond_or_0', ConditionalType(cstructs, 'uint32', 0))
-cstructs.addtype('uint32_cond_or_6000', ConditionalType(cstructs, 'uint32', 6000))
-cstructs.addtype('uint32_chars', LengthPrefixedArray(cstructs, 'uint32', 'char'))
-cstructs.addtype('uint32_uint32_chars', LengthPrefixedArray(cstructs, 'uint32', 'uint32_chars'))
-cstructs.addtype('uint32_cstrs', LengthPrefixedArray(cstructs, 'uint32', 'cstr'))
-cstructs.addtype('uint32_uint8s', LengthPrefixedArray(cstructs, 'uint32', 'uint8'))
-cstructs.addtype('uint32_uint32s', LengthPrefixedArray(cstructs, 'uint32', 'uint32'))
-cstructs.addtype('uint32_int32s', LengthPrefixedArray(cstructs, 'uint32', 'int32'))
-cstructs.addtype('encrypted', AdditionEncryptedString(cstructs, 'uint32', b'Avis Durgan'))
+cstructs.add_type('cstr', cstructs._make_type('cstr', (str,ZeroTerminated), None, alignment=1, attrs=dict(type=cstructs.typedefs['char'])))
+#cstructs.add_type('SCOMchars', Constant(cstructs, 'char', b'SCOM'))
+cstructs.add_type('uint32_cond_or_0', cstructs._make_type('uint32_cond_or_0', (int,ConditionalType,), None, alignment=4, attrs=dict(type=cstructs.typedefs['uint32'],dflt=0)))
+cstructs.add_type('uint32_cond_or_6000', cstructs._make_type('uint32_cond_or_6000', (int,ConditionalType,), None, alignment=4, attrs=dict(type=cstructs.typedefs['uint32'],dflt=6000)))
+cstructs.add_type('uint32_chars', cstructs._make_type('uint32_chars', (str,LengthPrefixedArray), None, alignment=1, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['char'])))
+cstructs.add_type('uint32_uint32_chars', cstructs._make_type('uint32_uint32_chars', (list,LengthPrefixedArray,), None, alignment=1, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['uint32_chars'])))
+cstructs.add_type('uint32_cstrs', cstructs._make_type('uint32_cstrs', (str,LengthPrefixedArray,), None, alignment=1, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['cstr'])))
+cstructs.add_type('uint32_uint8s', cstructs._make_type('uint32_uint8s', (list,LengthPrefixedArray,), None, alignment=1, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['uint8'])))
+cstructs.add_type('uint32_uint32s', cstructs._make_type('uint32_uint32s', (list,LengthPrefixedArray,), None, alignment=4, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['uint32'])))
+cstructs.add_type('uint32_int32s', cstructs._make_type('uint32_int32s', (list,LengthPrefixedArray,), None, alignment=4, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['int32'])))
+cstructs.add_type('encrypted', cstructs._make_type('encrypted', (str,AdditionEncryptedString,), None, alignment=1, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['uint8'], key=b'Avis Durgan')))
 #cstructs.addtype('cstr_for', MaskItems(cstructs, 'cstr', 1, 0)
 #cstructs.addtype('encrypted_for', MaskItems(cstructs, 'encrypted', 1, 0)
 #cstructs.load('typedef cstr_for[f_g_msgs] cstr_for_f_g_msgs;')
@@ -225,7 +235,7 @@ struct Cursor {
 };
 struct CommandList00 {
   uint8 flag;
-  uint32_cond_or_0 n_cmds[flag == 1];
+  uint32_cond_or_0 n_cmds[flag eq 1];
   uint32 types[n_cmds];
    int32 f_resps[n_cmds];
   uint8 unimplemntedted[unimplemented use MaskItems or andsumright to implement];
@@ -277,7 +287,7 @@ struct Script {
   uint32_cstrs imports;
   uint32 n_exports;
   Placement exports[n_exports];
-  uint32_cond_or_0 n_sections[ver >= 83];
+  uint32_cond_or_0 n_sections[ver gte 83];
   Placement sections[n_sections];
   uint32 BEEFCAFE;
 };
@@ -338,7 +348,7 @@ struct Dialog {
   uint32 topicflags;
 };
 struct Dialog00 {
-  uint32 unimplemented[old dialog scripts not implemented, mqybe use custom type];
+  uint32 unimplemented[old dialog scripts not implemented mqybe use custom type];
 };
 struct GUIObj000 {
   uint32 unk[7];
@@ -350,7 +360,7 @@ struct GUIObj106 {
 struct GUIObj108 {
   uint32 unk[7];
   cstr scriptname;
-  uint32_cstr evt_handlers;
+  uint32_cstrs evt_handlers;
 };
 struct GUIObj119 {
   //uint32 unk[6];
@@ -359,7 +369,7 @@ struct GUIObj119 {
   Coord2x32 size;
   uint32 zorder;
   cstr scriptname;
-  uint32_cstr evt_handlers;
+  uint32_cstrs evt_handlers;
 };
 struct GUIButtonData000 {
   uint32 unk[12];
@@ -367,7 +377,8 @@ struct GUIButtonData000 {
    int32 alignment;
   uint32 reserved;
 };
-struct GUIButton119 : GUIObj119 {
+struct GUIButton119 {
+  GUIObj119 ctl;
   uint32 pic;
   uint32 overpic;
   uint32 pushedpic;
@@ -390,8 +401,8 @@ struct GUI000 {
   uint32 n_buttons;
 };
 struct GUI118 {
-  uint32_char name;
-  uint32_char onclick;
+  uint32_chars name;
+  uint32_chars onclick;
   Coord2x32 pos;
   Coord2x32 size;
   uint32 n_objs;
@@ -400,8 +411,8 @@ struct GUI118 {
   uint32 n_buttons;
 };
 struct GUI119 {
-  uint32_char name;
-  uint32_char onclick;
+  uint32_chars name;
+  uint32_chars onclick;
   uint32 x;
   uint32 y;
   uint32 width;
@@ -414,9 +425,9 @@ struct GUI119 {
 struct DataFile {
   char SIG[30];
   uint32 data_ver;
-  uint32_cond_or_0 editor_ver_len[data_ver >= 12];
+  uint32_cond_or_0 editor_ver_len[data_ver gte 12];
   char editor_ver[editor_ver_len];
-  uint32_cond_or_0 n_caps[data_ver >= 48];
+  uint32_cond_or_0 n_caps[data_ver gte 48];
   uint32_uint8s caps[n_caps];
   char game_name[50];
   uint8 padding_base_name[2];
@@ -440,7 +451,7 @@ struct DataFile {
   uint32 n_guis;
   uint32 n_cursors;
   uint32 res_id;
-  uint32 res_custom[data_ver >= 43 & res_id == 8 & 2]; // note: (((data_ver >= 43) & res_id) == 8) & 2
+  uint32 res_custom[(data_ver gte 43) & (res_id eq 8) & 2];
   uint32 lipsync_frame;
   uint32 inv_hotspot;
   uint8 padding_reserved[17*4];
@@ -449,49 +460,49 @@ struct DataFile {
   uint32 f_g_script;
   uint32 f_chars;
   uint32 f_scom;
-  char guid[data_ver > 32 & 40];
-  char save_ext[data_ver > 32 & 20];
-  char save_dir[data_ver > 32 & 50];
-  Font00 fonts00[data_ver < 50 & n_fonts];
-  Font48 fonts48[data_ver == 48 & n_fonts];
-  Font49 fonts48[data_ver == 49 & n_fonts];
-  Font50 fonts50[data_ver >= 50 & n_fonts];
-  uint32_cond_or_6000 n_sprites[data_ver > 23];
+  char guid[(data_ver gte 33) & 40];
+  char save_ext[(data_ver gte 33) & 20];
+  char save_dir[(data_ver gte 33) & 50];
+  Font00 fonts00[(data_ver lt 50) & n_fonts];
+  Font48 fonts48[(data_ver eq 48) & n_fonts];
+  Font49 fonts49[(data_ver eq 49) & n_fonts];
+  Font50 fonts50[(data_ver gte 50) & n_fonts];
+  uint32_cond_or_6000 n_sprites[data_ver gt 23];
   uint8 sprite_flags[n_sprites];
   uint8 padding_item[68];
   Item items[n_items-1];
   Cursor cursors[n_cursors];
-  CommandList00 char_evts00[data_ver <  33 & n_chars];
-  CommandList33 char_evts33[data_ver >= 33 & n_chars];
-  CommandList00 item_evts00[data_ver <  33 & n_items-1];
-  CommandList33 item_evts33[data_ver >= 33 & n_items-1];
-  uint32_cond_or_0 n_g_vars[data_ver < 33];
+  CommandList00 char_evts00[(data_ver lt  33) & n_chars];
+  CommandList33 char_evts33[(data_ver gte 33) & n_chars];
+  CommandList00 item_evts00[(data_ver lt  33) & (n_items-1)];
+  CommandList33 item_evts33[(data_ver gte 33) & (n_items-1)];
+  uint32_cond_or_0 n_g_vars[data_ver lt 33];
   uint8 g_vars[n_g_vars][28];
-  uint32_cond_or_0 n_words[f_dict == 1];
+  uint32_cond_or_0 n_words[f_dict eq 1];
   Word dict[n_words];
-  Script g_scripts[data_ver >= 38 & 1 + 1];
-  uint32_cond_or_0 n_scripts[data_ver >= 31];
+  Script g_scripts[((data_ver gte 38) & 1) + 1];
+  uint32_cond_or_0 n_scripts[data_ver gte 31];
   Script scripts[n_scripts];
-  View00 views[data_ver <  33 & n_views];
-  View33 views[data_ver >= 33 & n_views];
-  uint8 unknown[data_ver < 20 & 0x204];
+  View00 views00[(data_ver lt  33 & n_views];
+  View33 views38[(data_ver gte 33) & n_views];
+  uint8 unknown[(data_ver lt 20) & 0x204];
   Character chars[n_chars];
-  uint32_uint8s lipsyncframes[data_ver >= 20 & 50];
-  cstr g_msgs00[data_ver < 26 andsumright f_g_msgs];
-  encrypted g_msgs26[data_ver >= 26 andsumright f_g_msgs];
+  uint32_uint8s lipsyncframes[(data_ver gte 20) & 50];
+  cstr g_msgs00[(data_ver lt 26) andsumright f_g_msgs];
+  encrypted g_msgs26[(data_ver gte 26) andsumright f_g_msgs];
   Dialog dlgs[n_dlgs];
-  Dialog00 dlg_scripts[data_ver < 38 && n_dlgs];
+  Dialog00 dlg_scripts[(data_ver lt 38) & n_dlgs];
   uint32 CAFEBEEF;
   uint32 gui_verct0;
-  uint32_cond_or_0 gui_verct1[gui_verct0 >= 100];
-#define gui_ver gui_verct0 >= 100 & guiverct0
-#define n_guis gui_verct0 < 100 & gui_verct0 | gui_verct1
+  uint32_cond_or_0 gui_verct1[gui_verct0 gte 100];
+//#define gui_ver gui_verct0 gte 100 & guiverct0
+//#define n_guis gui_verct0 lt 100 & gui_verct0 | gui_verct1
 };
 '''
 cstructs.load(cdef, compiled=False)
 class DataFile:
     @classmethod
-    def from_stream(self, stream):
+    def from_stream(cls, stream):
         #import pdb; pdb.set_trace()
         datafile = cstructs.DataFile(stream)
         return datafile

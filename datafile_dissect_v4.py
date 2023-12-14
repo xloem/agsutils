@@ -483,7 +483,7 @@ struct DataFile {
   Script g_scripts[((data_ver gte 38) & 1) + 1];
   uint32_cond_or_0 n_scripts[data_ver gte 31];
   Script scripts[n_scripts];
-  View00 views00[(data_ver lt  33 & n_views];
+  View00 views00[(data_ver lt  33) & n_views];
   View33 views38[(data_ver gte 33) & n_views];
   uint8 unknown[(data_ver lt 20) & 0x204];
   Character chars[n_chars];

@@ -1,5 +1,5 @@
 import warnings
-warnings.warn('this code was made against the refactor-v4 branch of dissect.cstruct commit ee0786cbf6477149935c76686e33ae46638a9214 with pull requests 58 and 60 patched on, hopefully available at httpa://github.com/xloem/cstruct in branch merged')
+warnings.warn('this code was made against xloem/cstruct/merged')
 import dissect.cstruct
 
 # You can implement your own types by subclassing BaseType or RawType, and
@@ -55,29 +55,56 @@ class ConditionalType(dissect.cstruct.BaseType):
             else:
                 return 0
 
-#class ConstantType(dissect.cstruct.BaseType):
-#    def __init__(self, cstruct, type, value):
-#        self.subtype = cstruct.typedefs[type]
-#        self.value = value
-#    def __getattr__(self, name):
-#        return getattr(self.subtype, name)
-#    def _read(self, stream, context = None):
-#        data = self.subtype._read(stream, context)
-#        assert data == self.value
-#        return data
-#    def _read_array(self, stream, count, context = None):
-#        if self.value == b'SCOM':
-#            import pdb; pdb.set_trace()
-#        data = self.subtype._read_array(stream, count, context)
-#        assert data == self.value
-#        return data
-#    def _write(self, stream, data):
-#        assert data == self.value
-#        return self.subtype._write(stream, data)
-#    def default(self):
-#        return self.value
-#    def default_array(self):
-#        return self.value
+class ConstantType(dissect.cstruct.BaseType):
+    type : dissect.cstruct.BaseType
+    class ArrayType(dissect.cstruct.BaseType, metaclass=dissect.cstruct.types.ArrayMetaType):
+        @classmethod
+        def _read(cls, stream, context):
+            expected = cls.num_entries
+            expected = cls.type.type(expected)
+            data = cls.type.type._read(stream, context)
+            assert data == expected
+            return data
+        @classmethod
+        def _write(cls, stream, data):
+            expected = cls.num_entries
+            expected = cls.type.type(expected)
+            assert data == expected
+            return cls.type.type._write(stream, data) 
+
+class ValueTerminatedArray(dissect.cstruct.BaseType):
+    type : dissect.cstruct.BaseType
+    class ArrayType(dissect.cstruct.BaseType, metaclass=dissect.cstruct.types.ArrayMetaType):
+        @classmethod
+        def _read(cls, stream, context):
+            term = cls.num_entries
+            term = cls.type.type(term)
+            result = []
+            while (item := cls.type.type._read(stream, context)) != term:
+                result.append(item)
+            return result
+        @classmethod
+        def _write(cls, stream, data):
+            result = 0
+            for item in data:
+                result += cls.type.type._write(stream, item) 
+            term = cls.num_entries
+            term = cls.type.type(term)
+            result += cls.type.type._write(stream, term) 
+            return result
+
+#class LengthPrefixedArray:
+#    type : dissect.cstruct.BaseType
+#    class ArrayType(dissect.cstruct.BaseType, metaclass=dissect.cstruct.types.ArrayMetaType):
+#        @classmethod
+#        def _read(cls, stream, context):
+#            prefixtype = cls.cs._typedefs[cls.num_entries.expression]
+#            count = prefixtype._read(stream, context)
+#            return cls.type.type._read_array(stream, count, context)
+#        @classmethod
+#        def _write(cls, stream, data):
+#            prefixtype = cls.cs._typedefs[cls.num_entries.expression]
+#            return prefixtype._write(stream, len(data)) + cls.type.type._write_array(stream, data) 
 
 class LengthPrefixedArray(dissect.cstruct.BaseType):
     prefixtype : type
@@ -146,6 +173,8 @@ class AdditionEncryptedString(LengthPrefixedArray):
 cstructs = dissect.cstruct.cstruct()
 cstructs.add_type('cstr', cstructs._make_type('cstr', (str,ZeroTerminated), None, alignment=1, attrs=dict(type=cstructs.typedefs['char'])))
 #cstructs.add_type('SCOMchars', Constant(cstructs, 'char', b'SCOM'))
+cstructs.add_type('uint32_const', cstructs._make_type('uint32_const', (int,ConstantType,), None, alignment=4, attrs=dict(type=cstructs.typedefs['uint32'])))
+cstructs.add_type('uint32s_to', cstructs._make_type('uint32s_to', (int,ValueTerminatedArray,), None, alignment=4, attrs=dict(type=cstructs.typedefs['uint32'])))
 cstructs.add_type('uint32_cond_or_0', cstructs._make_type('uint32_cond_or_0', (int,ConditionalType,), None, alignment=4, attrs=dict(type=cstructs.typedefs['uint32'],dflt=0)))
 cstructs.add_type('uint32_cond_or_6000', cstructs._make_type('uint32_cond_or_6000', (int,ConditionalType,), None, alignment=4, attrs=dict(type=cstructs.typedefs['uint32'],dflt=6000)))
 cstructs.add_type('uint32_chars', cstructs._make_type('uint32_chars', (str,LengthPrefixedArray), None, alignment=1, attrs=dict(prefixtype=cstructs.typedefs['uint32'], itemtype=cstructs.typedefs['char'])))
@@ -273,7 +302,7 @@ struct Placement {
   int32 offset;
 };
 struct Script {
-  char SCOM[4];
+  uint32_const SCOM[0x4d4f4353];
   uint32 ver;
   uint32 g_datasize;
   uint32 codesize;
@@ -289,7 +318,7 @@ struct Script {
   Placement exports[n_exports];
   uint32_cond_or_0 n_sections[ver gte 83];
   Placement sections[n_sections];
-  uint32 BEEFCAFE;
+  uint32_const BEEFCAFE[0xBEEFCAFE];
 };
 struct Character {
   uint32 def_view;
